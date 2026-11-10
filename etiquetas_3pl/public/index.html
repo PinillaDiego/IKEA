@@ -121,7 +121,7 @@
             <input type="file" name="fileEnvia" accept=".xlsx,.xls" hidden>
           </label>
         </div>
-        <p><label><input type="checkbox" id="reset"> Reiniciar auditoría (nueva jornada / nueva ola)</label></p>
+        <p><label><input type="checkbox" id="chkReset"> Reiniciar auditoría (nueva jornada / nueva ola)</label></p>
         <button class="btn" type="submit" id="btnUpload">Cargar y cruzar</button>
       </form>
     </div>
@@ -603,32 +603,60 @@ const aTexto = v => {
 const normCol = k => String(k ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "")
   .trim().toLowerCase().replace(/[\s.\-]+/g, "_");
 
-/* Lee el primer bloque de la hoja que tenga los encabezados `clave`, buscando la fila
-   de encabezados en las primeras 30 filas de cada hoja (sirve para .xlsx, .xls y los
-   "xls" que exportan los portales web, que por dentro son tablas HTML). */
+/* Devuelve las "hojas" del archivo como listas de filas.
+   - Excel real (.xlsx/.xls): cada hoja del libro.
+   - Página web guardada como .xls (lo que exportan portales como el de Envía):
+     cada <table> de la página, leída con el navegador para no confundirse con scripts. */
+async function hojasDelArchivo(file){
+  const buf = await file.arrayBuffer();
+  const ini = new TextDecoder("utf-8").decode(buf.slice(0, 4096)).replace(/^﻿/, "").trimStart().toLowerCase();
+  const esHtml = ini.startsWith("<") || ini.includes("<html") || ini.includes("<table");
+  if (esHtml){
+    let texto = new TextDecoder("utf-8").decode(buf);
+    if (texto.includes("�")) texto = new TextDecoder("windows-1252").decode(buf);
+    const doc = new DOMParser().parseFromString(texto, "text/html");
+    doc.querySelectorAll("script, style, noscript").forEach(n => n.remove());
+    const limpia = s => String(s ?? "").replace(/ /g, " ").replace(/\s+/g, " ").trim();
+    return [...doc.querySelectorAll("table")].map((t, n) => ({
+      nombre: `tabla ${n + 1}`,
+      filas: [...t.rows].map(r => [...r.cells].map(c => limpia(c.textContent))),
+    }));
+  }
+  const wb = XLSX.read(buf, { cellDates: false });
+  return wb.SheetNames.map(nombre => ({
+    nombre,
+    filas: XLSX.utils.sheet_to_json(wb.Sheets[nombre], { header: 1, defval: "", raw: true, blankrows: false }),
+  }));
+}
+
+/* Busca, en las primeras 30 filas de cada hoja/tabla, la fila de encabezados que tenga
+   las columnas `claves`, y devuelve los registros que siguen. Si hay varias candidatas,
+   se queda con la que trae más registros. */
 async function leerHoja(file, claves, requeridas, enviar, nombre){
-  let wb;
-  try { wb = XLSX.read(await file.arrayBuffer(), { cellDates: false }); }
+  let hojas;
+  try { hojas = await hojasDelArchivo(file); }
   catch(e){ throw new Error(`No se pudo abrir el archivo ${nombre}: ${e.message}`); }
 
-  for (const hoja of wb.SheetNames){
-    const filas = XLSX.utils.sheet_to_json(wb.Sheets[hoja], { header: 1, defval: "", raw: true, blankrows: false });
+  let mejor = null;
+  for (const hoja of hojas){
+    const filas = hoja.filas;
     const iEnc = filas.slice(0, 30).findIndex(f => { const c = f.map(normCol); return claves.every(k => c.includes(k)); });
     if (iEnc < 0) continue;
     const enc = filas[iEnc].map(normCol);
     const datos = filas.slice(iEnc + 1)
       .filter(f => f.some(v => String(v).trim() !== ""))
-      .map(f => Object.fromEntries(enc.map((k, n) => [k, f[n]])));
-    if (!datos.length) throw new Error(`El archivo ${nombre} tiene encabezados (fila ${iEnc + 1}, hoja "${hoja}") pero no trae registros`);
-    const faltan = requeridas.filter(c => !enc.includes(c));
-    if (faltan.length) throw new Error(`Faltan columnas en ${nombre}: ${faltan.join(", ")}`);
-    return datos.map(r => Object.fromEntries(enviar.map(c => [c, aTexto(r[c])])));
+      .map(f => Object.fromEntries(enc.map((k, n) => [k, f[n]])))
+      .filter(r => claves.every(k => String(r[k] ?? "").trim() !== ""));   // descarta paginadores/totales
+    if (!mejor || datos.length > mejor.datos.length) mejor = { hoja, iEnc, enc, datos };
   }
-  const vistas = wb.SheetNames.map(hn => {
-    const f = XLSX.utils.sheet_to_json(wb.Sheets[hn], { header: 1, defval: "", blankrows: false })[0] || [];
-    return `"${hn}": ${f.slice(0, 6).join(" | ") || "(vacía)"}`;
-  }).join(" · ");
-  throw new Error(`No se encontró la fila de encabezados en ${nombre} (se buscaron las columnas ${claves.join(", ")}). Primeras celdas: ${vistas}`);
+  if (mejor){
+    if (!mejor.datos.length) throw new Error(`El archivo ${nombre} tiene encabezados (${mejor.hoja.nombre}, fila ${mejor.iEnc + 1}) pero no trae registros`);
+    const faltan = requeridas.filter(c => !mejor.enc.includes(c));
+    if (faltan.length) throw new Error(`Faltan columnas en ${nombre}: ${faltan.join(", ")}`);
+    return mejor.datos.map(r => Object.fromEntries(enviar.map(c => [c, aTexto(r[c])])));
+  }
+  const vistas = hojas.slice(0, 6).map(hj => `"${hj.nombre}": ${(hj.filas[0] || []).slice(0, 6).join(" | ") || "(vacía)"}`).join(" · ");
+  throw new Error(`No se encontró la fila de encabezados en ${nombre} (se buscaron las columnas ${claves.join(", ")}). Contenido encontrado: ${vistas || "ninguna tabla"}`);
 }
 
 const form = $("#formUpload");
@@ -638,7 +666,7 @@ form.onsubmit = async e => {
   e.preventDefault();
   const fS = form.fileSCI.files[0], fE = form.fileEnvia.files[0];
   if (!fS || !fE) return alert("Seleccione ambos archivos");
-  const reset = $("#reset").checked;
+  const reset = $("#chkReset").checked;
   if (reset && !confirm("¿Reiniciar la auditoría? Se empezará un registro nuevo de etiquetas impresas.")) return;
   $("#btnUpload").disabled = true; $("#btnUpload").textContent = "Procesando…";
   const box = $("#uploadRes"); box.classList.remove("hidden");
@@ -659,7 +687,7 @@ form.onsubmit = async e => {
       ${lista("⚠️ OLPN sin guía en ENVIA", d.olpns_sin_guia)}
       ${lista("⚠️ OLPN con más de una guía (se imprime la primera)", d.olpns_duplicados)}
       ${d.auditoria_reiniciada ? '<p class="muted">Auditoría reiniciada.</p>' : ""}`;
-    form.reset(); $("#nSCI").textContent = "Seleccionar .xlsx"; $("#nEnvia").textContent = "Seleccionar .xlsx o .xls";
+    HTMLFormElement.prototype.reset.call(form); $("#nSCI").textContent = "Seleccionar .xlsx"; $("#nEnvia").textContent = "Seleccionar .xlsx o .xls";
     refrescarEstado();
   }catch(err){
     box.innerHTML = `<h3 style="margin-top:0;color:var(--err)">❌ ${esc(err.message)}</h3>`;
