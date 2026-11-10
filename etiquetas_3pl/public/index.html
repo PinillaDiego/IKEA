@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Etiquetas 3PL</title>
+<title>Print3PL</title>
 <script src="https://cdn.sheetjs.com/xlsx-0.20.3/package/dist/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jsbarcode/3.11.6/JsBarcode.all.min.js"></script>
 <style>
@@ -63,7 +63,7 @@
 </head>
 <body>
 <header>
-  <h1>Etiquetas Envía</h1>
+  <h1>Print3PL</h1>
   <span class="pill" id="estado">Conectando…</span>
   <span class="pill" id="estadoBP">Impresora: —</span>
 </header>
@@ -74,6 +74,7 @@
     <button data-tab="cargar">Cargar archivos</button>
     <button data-tab="pendientes">Pendientes</button>
     <button data-tab="auditoria">Auditoría</button>
+    <button data-tab="historial">Historial</button>
     <button data-tab="config">Configuración</button>
   </nav>
 
@@ -148,6 +149,34 @@
       <p class="muted" id="cuentaAud"></p>
       <div class="scroll"><table><thead><tr><th>Fecha / hora</th><th>OLPN</th><th>Guía</th><th>Estación</th></tr></thead>
       <tbody id="tablaAud"></tbody></table></div>
+    </div>
+  </section>
+
+  <!-- HISTORIAL -->
+  <section id="tab-historial" class="hidden">
+    <div class="card">
+      <div class="row">
+        <h3 class="grow" style="margin:0">Cargas</h3>
+        <button class="btn ghost" id="refHist">Actualizar</button>
+      </div>
+      <p class="muted" id="cuentaHist"></p>
+      <div class="scroll" style="max-height:40vh"><table><thead><tr><th>Fecha de carga</th><th>Archivos</th><th>OLPN</th><th>Sin guía</th><th>Auditoría</th><th></th></tr></thead>
+      <tbody id="tablaHist"></tbody></table></div>
+    </div>
+    <div class="card" id="detHist" hidden>
+      <div class="row">
+        <h3 class="grow" style="margin:0" id="detTitulo">Detalle</h3>
+        <button class="btn" id="dlHist">Descargar Excel</button>
+      </div>
+      <p class="muted" id="detArchivos"></p>
+      <div class="stats" id="detStats"></div>
+      <div class="row" style="margin:14px 0 6px">
+        <input type="text" id="filtroDet" class="grow" placeholder="Filtrar por OLPN, guía, destino, estación…">
+        <select id="estadoDet"><option value="">Todos</option><option value="si">Impresos</option><option value="no">Pendientes</option></select>
+      </div>
+      <p class="muted" id="cuentaDet"></p>
+      <div class="scroll"><table><thead><tr><th>OLPN</th><th>Guía</th><th>Destinatario</th><th>Destino</th><th>Caja</th><th>Estado</th><th>Impreso</th><th>Estación</th></tr></thead>
+      <tbody id="tablaDet"></tbody></table></div>
     </div>
   </section>
 
@@ -401,6 +430,7 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   if (b.dataset.tab === "escanear") $("#scan").focus();
   if (b.dataset.tab === "pendientes") cargarPendientes();
   if (b.dataset.tab === "auditoria") cargarAuditoria();
+  if (b.dataset.tab === "historial") cargarHistorial();
 });
 const irA = tab => document.querySelector(`nav button[data-tab="${tab}"]`).click();
 
@@ -614,6 +644,62 @@ $("#filtroPend").oninput = pintarPend; $("#refPend").onclick = cargarPendientes;
 $("#filtroAud").oninput = pintarAud;  $("#refAud").onclick = cargarAuditoria;
 $("#dlPend").onclick = async () => { await cargarPendientes(); descargar(pend, "pendientes_etiquetas"); };
 $("#dlAud").onclick = async () => { await cargarAuditoria(); descargar([...aud].reverse(), "audit_etiquetas"); };
+
+/* ================= Historial ================= */
+let cargas = [], det = null;
+const nombreArchivos = a => a ? [a.sci, a.envia].filter(Boolean).join(" + ") : "—";
+async function cargarHistorial(){
+  try{
+    cargas = await api("historial");
+    $("#cuentaHist").textContent = cargas.length ? `${cargas.length} cargas registradas` : "Todavía no hay cargas.";
+    $("#tablaHist").innerHTML = cargas.map(c => `<tr>
+      <td>${esc(c.cargado_en)} ${c.actual ? '<span class="tag ok">Actual</span>' : ""}</td>
+      <td>${esc(nombreArchivos(c.archivos))}</td>
+      <td>${c.total ?? "—"}</td>
+      <td>${c.sin_guia ? `<span class="tag err">${c.sin_guia}</span>` : (c.sin_guia === 0 ? "0" : "—")}</td>
+      <td>${c.reinicio_auditoria ? '<span class="tag warn">Reiniciada</span>' : "Continúa"}</td>
+      <td><button class="btn ghost sm" data-carga="${esc(c.cruceId)}">Ver</button></td></tr>`).join("");
+  }catch(e){ $("#cuentaHist").textContent = e.message; }
+}
+$("#refHist").onclick = cargarHistorial;
+$("#tablaHist").addEventListener("click", async e => {
+  const b = e.target.closest("[data-carga]"); if (!b) return;
+  $("#detHist").hidden = false;
+  $("#detTitulo").textContent = "Cargando…"; $("#tablaDet").innerHTML = ""; $("#detStats").innerHTML = "";
+  try{
+    det = await api("historial/" + encodeURIComponent(b.dataset.carga));
+    const c = det.carga, r = det.resumen;
+    const pct = r.total ? Math.round(r.impresos * 100 / r.total) : 0;
+    $("#detTitulo").textContent = `Carga del ${c.cargado_en}${c.actual ? " (actual)" : ""}`;
+    $("#detArchivos").textContent = nombreArchivos(c.archivos);
+    $("#detStats").innerHTML = `
+      <div class="stat"><span class="muted">OLPN</span><b>${r.total}</b></div>
+      <div class="stat"><span class="muted">Impresos</span><b style="color:var(--ok)">${r.impresos}</b></div>
+      <div class="stat"><span class="muted">Pendientes</span><b style="color:${r.pendientes ? "var(--err)" : "inherit"}">${r.pendientes}</b></div>
+      <div class="stat"><span class="muted">Avance</span><b>${pct}%</b></div>`;
+    pintarDet();
+    $("#detHist").scrollIntoView({ behavior: "smooth", block: "start" });
+  }catch(err){ $("#detTitulo").textContent = "❌ " + err.message; det = null; }
+});
+function filasDet(){
+  if (!det) return [];
+  const est = $("#estadoDet").value;
+  return filtrar(det.filas, $("#filtroDet").value).filter(f => !est || (est === "si") === f.impreso);
+}
+function pintarDet(){
+  const rows = filasDet();
+  $("#cuentaDet").textContent = `${rows.length} de ${det.filas.length} OLPN`;
+  $("#tablaDet").innerHTML = rows.map(f => `<tr><td>${esc(f.olpn)}</td><td>${esc(f.guia)}</td><td>${esc(f.nom_destinatario)}</td><td>${esc(f.ciudest)}</td><td>${esc(f.caja)}</td>
+    <td><span class="tag ${f.impreso ? "ok" : "err"}">${f.impreso ? "Impreso" : "Pendiente"}</span></td><td>${esc(f.fecha_hora)}</td><td>${esc(f.estacion)}</td></tr>`).join("");
+}
+$("#filtroDet").oninput = () => det && pintarDet();
+$("#estadoDet").onchange = () => det && pintarDet();
+$("#dlHist").onclick = () => {
+  if (!det) return;
+  const filas = det.filas.map(f => ({ OLPN: f.olpn, Guia: f.guia, Documento: f.num_documentos, Destinatario: f.nom_destinatario,
+    Destino: f.ciudest, Caja: f.caja, Estado: f.impreso ? "Impreso" : "Pendiente", Fecha_impresion: f.fecha_hora, Estacion: f.estacion }));
+  descargar(filas, "historial_" + det.carga.cargado_en.replace(/[: ]/g, "-"));
+};
 
 /* ================= Inicio ================= */
 refrescarEstado();
