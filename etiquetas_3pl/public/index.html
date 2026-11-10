@@ -117,7 +117,7 @@
             <input type="file" name="fileSCI" accept=".xlsx,.xls" hidden>
           </label>
           <label class="file grow">
-            <b>Archivo ENVIA</b><br><span class="muted" id="nEnvia">Seleccionar .xlsx (encabezado en la fila 2)</span>
+            <b>Archivo ENVIA</b><br><span class="muted" id="nEnvia">Seleccionar .xlsx o .xls</span>
             <input type="file" name="fileEnvia" accept=".xlsx,.xls" hidden>
           </label>
         </div>
@@ -224,6 +224,7 @@
         <button class="btn ghost" id="pruebaImp">Imprimir prueba</button>
       </p>
       <p class="muted" id="cfgMsg"></p>
+      <p class="muted" id="cfgIp">IP pública de esta estación: consultando…</p>
       <details>
         <summary>¿No aparecen impresoras?</summary>
         <ol class="muted">
@@ -372,20 +373,28 @@ async function api(ruta, body){
 const BP = {
   base: null, devices: [],
   async conectar(){
+    const validos = arr => (arr || []).filter(d => d && typeof d === "object" && (d.uid || d.name));
     for (const b of ["https://127.0.0.1:9101/", "http://127.0.0.1:9100/"]){
-      try{
-        const r = await fetch(b + "available", { cache: "no-store" });
-        if (!r.ok) continue;
+      let r;
+      try { r = await fetch(b + "available", { cache: "no-store" }); } catch { continue; }
+      if (!r.ok) continue;
+      this.base = b;
+      let devs = [];
+      try {
         const d = await r.json();
-        this.base = b;
-        this.devices = (d.printer || []);
-        if (!this.devices.length){
+        // Browser Print agrupa por tipo: { printer:[...], ... }
+        for (const v of Object.values(d || {})) if (Array.isArray(v)) devs.push(...v);
+        devs = validos(devs).filter(x => !x.deviceType || /printer/i.test(x.deviceType));
+      } catch {}
+      if (!devs.length){
+        try {
           const r2 = await fetch(b + "default?type=printer", { cache: "no-store" });
-          const t = await r2.text();
-          if (t) this.devices = [JSON.parse(t)];
-        }
-        return this.devices;
-      }catch{}
+          const t = (await r2.text()).trim();
+          if (t) devs = validos([JSON.parse(t)]);
+        } catch {}
+      }
+      this.devices = devs;
+      return devs;
     }
     this.base = null; this.devices = [];
     throw new Error("Zebra Browser Print no responde en este PC");
@@ -393,8 +402,8 @@ const BP = {
   async dispositivo(){
     if (!this.base) await this.conectar();
     const uid = cfg.printerUid;
-    const d = this.devices.find(x => x.uid === uid) || this.devices[0];
-    if (!d) throw new Error("Browser Print no tiene impresoras configuradas");
+    const d = this.devices.find(x => (x.uid || x.name) === uid) || this.devices[0];
+    if (!d) throw new Error("Browser Print no tiene impresoras: en su ícono (junto al reloj) → Settings, elija la impresora predeterminada y autorice este sitio");
     return d;
   },
   async imprimir(zpl){
@@ -407,7 +416,12 @@ const BP = {
       this.base = null;
       throw new Error("Se perdió la conexión con Browser Print");
     }
-    if (!r.ok) throw new Error(`Browser Print rechazó el envío (${r.status}). ¿Impresora apagada o sin papel?`);
+    if (!r.ok){
+      let det = "";
+      try { det = (await r.text()).trim().slice(0, 200); } catch {}
+      throw new Error(`Browser Print no pudo enviar a ${device.name || "la impresora"}${device.uid && device.uid !== device.name ? " (" + device.uid + ")" : ""}: ` +
+        (det || `error ${r.status}`) + ". Revise que la impresora esté encendida, lista y accesible desde este PC.");
+    }
   }
 };
 
@@ -415,13 +429,15 @@ async function refrescarImpresoras(){
   const sel = $("#cfgPrinter");
   try{
     const devs = await BP.conectar();
+    const nombre = d => `${d.name || d.uid}${d.connection ? " (" + d.connection + ")" : ""}`;
     sel.innerHTML = devs.length
-      ? devs.map(d => `<option value="${esc(d.uid)}">${esc(d.name)} (${esc(d.connection)})</option>`).join("")
-      : `<option value="">Sin impresoras en Browser Print</option>`;
-    if (cfg.printerUid && devs.some(d => d.uid === cfg.printerUid)) sel.value = cfg.printerUid;
-    const d = devs.find(x => x.uid === sel.value) || devs[0];
-    $("#estadoBP").textContent = d ? `Impresora: ${d.name}` : "Impresora: sin configurar";
+      ? devs.map(d => `<option value="${esc(d.uid || d.name)}">${esc(nombre(d))}</option>`).join("")
+      : `<option value="">Browser Print no devolvió impresoras</option>`;
+    if (cfg.printerUid && devs.some(d => (d.uid || d.name) === cfg.printerUid)) sel.value = cfg.printerUid;
+    const d = devs.find(x => (x.uid || x.name) === sel.value) || devs[0];
+    $("#estadoBP").textContent = d ? `Impresora: ${d.name || d.uid}` : "Browser Print sin impresoras";
     $("#estadoBP").className = "pill " + (d ? "ok" : "err");
+    if (!d) $("#cfgMsg").innerHTML = "⚠️ Browser Print está activo pero no entregó impresoras. En su ícono junto al reloj → <b>Settings</b>: elija la impresora en <b>Default Devices</b> y revise que este sitio esté en <b>Accepted Hosts</b>. Luego pulse <b>Buscar impresoras</b> de nuevo.";
   }catch(e){
     sel.innerHTML = `<option value="">Browser Print no disponible</option>`;
     $("#estadoBP").textContent = "Browser Print no disponible";
@@ -493,7 +509,7 @@ async function refrescarEstado(){
     $("#progBar").style.width = pct + "%";
   }catch(e){
     $("#estado").textContent = e.message; $("#estado").className = "pill err";
-    if (/PIN/.test(e.message)) irA("config");
+    if (/PIN|red/.test(e.message)) irA("config");
   }
 }
 
@@ -584,24 +600,40 @@ const aTexto = v => {
   return String(v).trim();
 };
 
-async function leerHoja(file, filaEncabezado, requeridas, enviar, nombre){
-  const wb = XLSX.read(await file.arrayBuffer(), { cellDates: false });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  const filas = XLSX.utils.sheet_to_json(ws, { range: filaEncabezado, defval: "", raw: true });
-  const datos = filas.map(r => {
-    const o = {};
-    for (const [k, v] of Object.entries(r)) o[String(k).trim().toLowerCase()] = v;
-    return o;
-  });
-  if (!datos.length) throw new Error(`El archivo ${nombre} está vacío`);
-  const faltan = requeridas.filter(c => !(c in datos[0]));
-  if (faltan.length) throw new Error(`Faltan columnas en ${nombre}: ${faltan.join(", ")}`);
-  return datos.map(r => Object.fromEntries(enviar.map(c => [c, aTexto(r[c])])));
+const normCol = k => String(k ?? "").normalize("NFD").replace(/[̀-ͯ]/g, "")
+  .trim().toLowerCase().replace(/[\s.\-]+/g, "_");
+
+/* Lee el primer bloque de la hoja que tenga los encabezados `clave`, buscando la fila
+   de encabezados en las primeras 30 filas de cada hoja (sirve para .xlsx, .xls y los
+   "xls" que exportan los portales web, que por dentro son tablas HTML). */
+async function leerHoja(file, claves, requeridas, enviar, nombre){
+  let wb;
+  try { wb = XLSX.read(await file.arrayBuffer(), { cellDates: false }); }
+  catch(e){ throw new Error(`No se pudo abrir el archivo ${nombre}: ${e.message}`); }
+
+  for (const hoja of wb.SheetNames){
+    const filas = XLSX.utils.sheet_to_json(wb.Sheets[hoja], { header: 1, defval: "", raw: true, blankrows: false });
+    const iEnc = filas.slice(0, 30).findIndex(f => { const c = f.map(normCol); return claves.every(k => c.includes(k)); });
+    if (iEnc < 0) continue;
+    const enc = filas[iEnc].map(normCol);
+    const datos = filas.slice(iEnc + 1)
+      .filter(f => f.some(v => String(v).trim() !== ""))
+      .map(f => Object.fromEntries(enc.map((k, n) => [k, f[n]])));
+    if (!datos.length) throw new Error(`El archivo ${nombre} tiene encabezados (fila ${iEnc + 1}, hoja "${hoja}") pero no trae registros`);
+    const faltan = requeridas.filter(c => !enc.includes(c));
+    if (faltan.length) throw new Error(`Faltan columnas en ${nombre}: ${faltan.join(", ")}`);
+    return datos.map(r => Object.fromEntries(enviar.map(c => [c, aTexto(r[c])])));
+  }
+  const vistas = wb.SheetNames.map(hn => {
+    const f = XLSX.utils.sheet_to_json(wb.Sheets[hn], { header: 1, defval: "", blankrows: false })[0] || [];
+    return `"${hn}": ${f.slice(0, 6).join(" | ") || "(vacía)"}`;
+  }).join(" · ");
+  throw new Error(`No se encontró la fila de encabezados en ${nombre} (se buscaron las columnas ${claves.join(", ")}). Primeras celdas: ${vistas}`);
 }
 
 const form = $("#formUpload");
 form.fileSCI.onchange = () => $("#nSCI").textContent = form.fileSCI.files[0]?.name || "Seleccionar .xlsx";
-form.fileEnvia.onchange = () => $("#nEnvia").textContent = form.fileEnvia.files[0]?.name || "Seleccionar .xlsx (encabezado en la fila 2)";
+form.fileEnvia.onchange = () => $("#nEnvia").textContent = form.fileEnvia.files[0]?.name || "Seleccionar .xlsx o .xls";
 form.onsubmit = async e => {
   e.preventDefault();
   const fS = form.fileSCI.files[0], fE = form.fileEnvia.files[0];
@@ -612,8 +644,8 @@ form.onsubmit = async e => {
   const box = $("#uploadRes"); box.classList.remove("hidden");
   box.innerHTML = '<span class="muted">Leyendo archivos…</span>';
   try{
-    const sci = await leerHoja(fS, 0, SCI_REQ, SCI_ENVIAR, "SCI");
-    const envia = await leerHoja(fE, 1, ENVIA_REQ, ENVIA_ENVIAR, "ENVIA");
+    const sci = await leerHoja(fS, ["texto_guia", "num_documentos"], SCI_ENVIAR, SCI_ENVIAR, "SCI");
+    const envia = await leerHoja(fE, ["guia", "num_documentos"], ENVIA_ENVIAR, ENVIA_ENVIAR, "ENVIA");
     box.innerHTML = '<span class="muted">Cruzando y guardando…</span>';
     const d = await api("upload", { sci, envia, resetAudit: reset, archivos: { sci: fS.name, envia: fE.name } });
     const lista = (t, arr) => arr.length ? `<details><summary>${t} (${arr.length})</summary><p class="muted">${arr.map(esc).join(", ")}</p></details>` : "";
@@ -627,7 +659,7 @@ form.onsubmit = async e => {
       ${lista("⚠️ OLPN sin guía en ENVIA", d.olpns_sin_guia)}
       ${lista("⚠️ OLPN con más de una guía (se imprime la primera)", d.olpns_duplicados)}
       ${d.auditoria_reiniciada ? '<p class="muted">Auditoría reiniciada.</p>' : ""}`;
-    form.reset(); $("#nSCI").textContent = "Seleccionar .xlsx"; $("#nEnvia").textContent = "Seleccionar .xlsx (encabezado en la fila 2)";
+    form.reset(); $("#nSCI").textContent = "Seleccionar .xlsx"; $("#nEnvia").textContent = "Seleccionar .xlsx o .xls";
     refrescarEstado();
   }catch(err){
     box.innerHTML = `<h3 style="margin-top:0;color:var(--err)">❌ ${esc(err.message)}</h3>`;
@@ -769,9 +801,18 @@ $("#fLimpiar").onclick = () => {
 };
 $("#fDesde").onchange = $("#fHasta").onchange = () => cargas.length && pintarCargas();
 
+async function mostrarIp(){
+  try{
+    const r = await fetch("/api/mi-ip"); const d = await r.json();
+    $("#cfgIp").innerHTML = `IP pública de esta estación: <b>${esc(d.ip || "desconocida")}</b>` +
+      (d.restringido ? (d.permitida ? ' <span class="tag ok">Red autorizada</span>' : ' <span class="tag err">Red no autorizada</span>') : ' <span class="muted">(sin restricción de IP)</span>');
+  }catch{ $("#cfgIp").textContent = "No se pudo consultar la IP pública."; }
+}
+
 /* ================= Inicio ================= */
 refrescarEstado();
 refrescarImpresoras();
+mostrarIp();
 setInterval(() => { if (!document.hidden) refrescarEstado(); }, 60000);
 if (!cfg.estacion) irA("config");
 </script>
