@@ -59,6 +59,10 @@
   .btn.sm{padding:4px 10px;font-size:13px}
   dialog{border:0;border-radius:12px;padding:20px;width:min(560px,94vw);background:var(--card);color:var(--ink);box-shadow:0 10px 40px #0004}
   dialog::backdrop{background:#0006}
+  .filtros{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-end}
+  .filtros label{display:flex;flex-direction:column;gap:4px;font-size:13px;color:var(--muted);min-width:0}
+  .filtros label.grow{flex:1 1 220px}
+  input[type=date]{padding:7px 10px;border:1px solid var(--line);border-radius:8px;color:var(--ink);background:var(--card);font:inherit}
 </style>
 </head>
 <body>
@@ -155,6 +159,25 @@
   <!-- HISTORIAL -->
   <section id="tab-historial" class="hidden">
     <div class="card">
+      <form id="formBuscar" class="filtros">
+        <label>Desde<input type="date" id="fDesde"></label>
+        <label>Hasta<input type="date" id="fHasta"></label>
+        <label class="grow">OLPN, guía o docs<input type="text" id="fOlpn" placeholder="Opcional: OLPN, número de guía o documento" autocomplete="off"></label>
+        <div class="row" style="gap:8px">
+          <button class="btn" type="submit">Buscar</button>
+          <button class="btn ghost" type="button" id="fLimpiar">Limpiar</button>
+        </div>
+      </form>
+    </div>
+    <div class="card" id="resBuscar" hidden>
+      <div class="row">
+        <h3 class="grow" style="margin:0" id="resTitulo">Resultados</h3>
+      </div>
+      <p class="muted" id="resInfo"></p>
+      <div class="scroll"><table><thead><tr><th>OLPN</th><th>Guía</th><th>Docs</th><th>Carga</th><th>Destinatario</th><th>Destino</th><th>Caja</th><th>Estado</th><th>Impreso</th><th>Estación</th><th></th></tr></thead>
+      <tbody id="tablaRes"></tbody></table></div>
+    </div>
+    <div class="card">
       <div class="row">
         <h3 class="grow" style="margin:0">Cargas</h3>
         <button class="btn ghost" id="refHist">Actualizar</button>
@@ -171,11 +194,11 @@
       <p class="muted" id="detArchivos"></p>
       <div class="stats" id="detStats"></div>
       <div class="row" style="margin:14px 0 6px">
-        <input type="text" id="filtroDet" class="grow" placeholder="Filtrar por OLPN, guía, destino, estación…">
+        <input type="text" id="filtroDet" class="grow" placeholder="Filtrar por OLPN, guía, docs, destino, estación…">
         <select id="estadoDet"><option value="">Todos</option><option value="si">Impresos</option><option value="no">Pendientes</option></select>
       </div>
       <p class="muted" id="cuentaDet"></p>
-      <div class="scroll"><table><thead><tr><th>OLPN</th><th>Guía</th><th>Destinatario</th><th>Destino</th><th>Caja</th><th>Estado</th><th>Impreso</th><th>Estación</th></tr></thead>
+      <div class="scroll"><table><thead><tr><th>OLPN</th><th>Guía</th><th>Docs</th><th>Destinatario</th><th>Destino</th><th>Caja</th><th>Estado</th><th>Impreso</th><th>Estación</th></tr></thead>
       <tbody id="tablaDet"></tbody></table></div>
     </div>
   </section>
@@ -648,26 +671,41 @@ $("#dlAud").onclick = async () => { await cargarAuditoria(); descargar([...aud].
 /* ================= Historial ================= */
 let cargas = [], det = null;
 const nombreArchivos = a => a ? [a.sci, a.envia].filter(Boolean).join(" + ") : "—";
+const isoDia = d => new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+function fechasPorDefecto(){
+  const hoy = new Date();
+  if (!$("#fHasta").value) $("#fHasta").value = isoDia(hoy);
+  if (!$("#fDesde").value) $("#fDesde").value = isoDia(new Date(hoy.getTime() - 29 * 86400000));
+}
+const enRango = c => { const d = (c.cargado_en || "").slice(0, 10); return (!$("#fDesde").value || d >= $("#fDesde").value) && (!$("#fHasta").value || d <= $("#fHasta").value); };
 async function cargarHistorial(){
+  fechasPorDefecto();
   try{
     cargas = await api("historial");
-    $("#cuentaHist").textContent = cargas.length ? `${cargas.length} cargas registradas` : "Todavía no hay cargas.";
-    $("#tablaHist").innerHTML = cargas.map(c => `<tr>
+    pintarCargas();
+  }catch(e){ $("#cuentaHist").textContent = e.message; }
+}
+function pintarCargas(){
+    const vis = cargas.filter(enRango);
+    $("#cuentaHist").textContent = cargas.length ? `${vis.length} de ${cargas.length} cargas en el rango de fechas` : "Todavía no hay cargas.";
+    $("#tablaHist").innerHTML = vis.map(c => `<tr>
       <td>${esc(c.cargado_en)} ${c.actual ? '<span class="tag ok">Actual</span>' : ""}</td>
       <td>${esc(nombreArchivos(c.archivos))}</td>
       <td>${c.total ?? "—"}</td>
       <td>${c.sin_guia ? `<span class="tag err">${c.sin_guia}</span>` : (c.sin_guia === 0 ? "0" : "—")}</td>
       <td>${c.reinicio_auditoria ? '<span class="tag warn">Reiniciada</span>' : "Continúa"}</td>
       <td><button class="btn ghost sm" data-carga="${esc(c.cruceId)}">Ver</button></td></tr>`).join("");
-  }catch(e){ $("#cuentaHist").textContent = e.message; }
 }
 $("#refHist").onclick = cargarHistorial;
-$("#tablaHist").addEventListener("click", async e => {
-  const b = e.target.closest("[data-carga]"); if (!b) return;
+$("#tablaHist").addEventListener("click", e => {
+  const b = e.target.closest("[data-carga]"); if (b) abrirCarga(b.dataset.carga, "");
+});
+async function abrirCarga(id, filtro){
   $("#detHist").hidden = false;
+  $("#filtroDet").value = filtro || ""; $("#estadoDet").value = "";
   $("#detTitulo").textContent = "Cargando…"; $("#tablaDet").innerHTML = ""; $("#detStats").innerHTML = "";
   try{
-    det = await api("historial/" + encodeURIComponent(b.dataset.carga));
+    det = await api("historial/" + encodeURIComponent(id));
     const c = det.carga, r = det.resumen;
     const pct = r.total ? Math.round(r.impresos * 100 / r.total) : 0;
     $("#detTitulo").textContent = `Carga del ${c.cargado_en}${c.actual ? " (actual)" : ""}`;
@@ -680,7 +718,7 @@ $("#tablaHist").addEventListener("click", async e => {
     pintarDet();
     $("#detHist").scrollIntoView({ behavior: "smooth", block: "start" });
   }catch(err){ $("#detTitulo").textContent = "❌ " + err.message; det = null; }
-});
+}
 function filasDet(){
   if (!det) return [];
   const est = $("#estadoDet").value;
@@ -689,7 +727,7 @@ function filasDet(){
 function pintarDet(){
   const rows = filasDet();
   $("#cuentaDet").textContent = `${rows.length} de ${det.filas.length} OLPN`;
-  $("#tablaDet").innerHTML = rows.map(f => `<tr><td>${esc(f.olpn)}</td><td>${esc(f.guia)}</td><td>${esc(f.nom_destinatario)}</td><td>${esc(f.ciudest)}</td><td>${esc(f.caja)}</td>
+  $("#tablaDet").innerHTML = rows.map(f => `<tr><td>${esc(f.olpn)}</td><td>${esc(f.guia)}</td><td>${esc(f.num_documentos)}</td><td>${esc(f.nom_destinatario)}</td><td>${esc(f.ciudest)}</td><td>${esc(f.caja)}</td>
     <td><span class="tag ${f.impreso ? "ok" : "err"}">${f.impreso ? "Impreso" : "Pendiente"}</span></td><td>${esc(f.fecha_hora)}</td><td>${esc(f.estacion)}</td></tr>`).join("");
 }
 $("#filtroDet").oninput = () => det && pintarDet();
@@ -700,6 +738,36 @@ $("#dlHist").onclick = () => {
     Destino: f.ciudest, Caja: f.caja, Estado: f.impreso ? "Impreso" : "Pendiente", Fecha_impresion: f.fecha_hora, Estacion: f.estacion }));
   descargar(filas, "historial_" + det.carga.cargado_en.replace(/[: ]/g, "-"));
 };
+
+$("#formBuscar").onsubmit = async e => {
+  e.preventDefault();
+  if ($("#fDesde").value && $("#fHasta").value && $("#fDesde").value > $("#fHasta").value){
+    $("#resBuscar").hidden = false; $("#resTitulo").textContent = "Rango de fechas inválido";
+    $("#resInfo").textContent = "La fecha Desde debe ser anterior o igual a Hasta."; $("#tablaRes").innerHTML = ""; return;
+  }
+  pintarCargas();
+  const q = $("#fOlpn").value.trim();
+  if (!q){ $("#resBuscar").hidden = true; return; }
+  $("#resBuscar").hidden = false; $("#resTitulo").textContent = "Buscando…"; $("#resInfo").textContent = ""; $("#tablaRes").innerHTML = "";
+  try{
+    const p = new URLSearchParams({ q, desde: $("#fDesde").value, hasta: $("#fHasta").value });
+    const d = await api("buscar?" + p);
+    $("#resTitulo").textContent = d.resultados.length ? `${d.resultados.length} resultado${d.resultados.length > 1 ? "s" : ""} para “${q}”` : `Sin resultados para “${q}”`;
+    $("#resInfo").textContent = `Se revisaron ${d.cargas_revisadas} cargas entre ${$("#fDesde").value || "el inicio"} y ${$("#fHasta").value || "hoy"}.` + (d.resultados.length >= 100 ? " Se muestran los primeros 100." : "");
+    $("#tablaRes").innerHTML = d.resultados.map(r => `<tr><td>${esc(r.olpn)}</td><td>${esc(r.guia)}</td><td>${esc(r.num_documentos)}</td>
+      <td>${esc(r.cargado_en)} ${r.actual ? '<span class="tag ok">Actual</span>' : ""}</td><td>${esc(r.destinatario)}</td><td>${esc(r.destino)}</td><td>${esc(r.caja)}</td>
+      <td><span class="tag ${r.impreso ? "ok" : "err"}">${r.impreso ? "Impreso" : "Pendiente"}</span></td><td>${esc(r.fecha_hora)}</td><td>${esc(r.estacion)}</td>
+      <td><button class="btn ghost sm" data-ir="${esc(r.cruceId)}" data-olpn="${esc(r.olpn)}">Ver carga</button></td></tr>`).join("");
+  }catch(err){ $("#resTitulo").textContent = "❌ " + err.message; }
+};
+$("#tablaRes").addEventListener("click", e => {
+  const b = e.target.closest("[data-ir]"); if (b) abrirCarga(b.dataset.ir, b.dataset.olpn);
+});
+$("#fLimpiar").onclick = () => {
+  $("#fDesde").value = ""; $("#fHasta").value = ""; $("#fOlpn").value = "";
+  fechasPorDefecto(); $("#resBuscar").hidden = true; pintarCargas();
+};
+$("#fDesde").onchange = $("#fHasta").onchange = () => cargas.length && pintarCargas();
 
 /* ================= Inicio ================= */
 refrescarEstado();
