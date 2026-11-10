@@ -10,6 +10,7 @@
  *   GET  /api/auditoria    registros impresos
  *   GET  /api/historial    cargas anteriores (más reciente primero)
  *   GET  /api/historial/<id>  detalle de una carga: cada OLPN con su estado de impresión
+ *   GET  /api/buscar?q=&desde=&hasta=  busca un OLPN, número de guía o documento en las cargas de un rango de fechas
  *
  * Seguridad: si la variable de entorno APP_PIN existe, cada petición debe traer
  * el encabezado X-App-Pin con ese valor.
@@ -230,6 +231,52 @@ export function crearHandler(obtenerStore) {
         if (meta && !hist.some((h) => h.cruceId === meta.cruceId))
           hist.push({ cruceId: meta.cruceId, auditId: meta.auditId, archivos: meta.archivos, cargado_en: meta.cargado_en });
         return json(hist.map((h) => ({ ...h, actual: h.cruceId === meta?.cruceId })).reverse());
+      }
+
+      if (req.method === "GET" && ruta === "buscar") {
+        const q = (url.searchParams.get("q") || url.searchParams.get("olpn") || "").trim().toUpperCase();
+        const desde = url.searchParams.get("desde") || "0000-00-00";
+        const hasta = url.searchParams.get("hasta") || "9999-99-99";
+        if (q.length < 3) return fallo("Escriba al menos 3 caracteres del OLPN, la guía o el documento");
+        const dias = (Date.parse(hasta) - Date.parse(desde)) / 86400000;
+        if (!(dias <= 92)) return fallo("El rango de fechas puede ser de máximo 3 meses");
+
+        const meta = await leerMeta(s);
+        const hist = await leerHist(s);
+        if (meta && !hist.some((h) => h.cruceId === meta.cruceId))
+          hist.push({ cruceId: meta.cruceId, auditId: meta.auditId, archivos: meta.archivos, cargado_en: meta.cargado_en });
+        const enRango = hist.filter((h) => { const d = (h.cargado_en || "").slice(0, 10); return d >= desde && d <= hasta; });
+
+        const resultados = [];
+        for (let i = 0; i < enRango.length; i += 8) {
+          const lote = enRango.slice(i, i + 8);
+          const filasLote = await Promise.all(lote.map((h) => s.get(`c/${h.cruceId}`, { type: "json" })));
+          for (let k = 0; k < lote.length; k++) {
+            const carga = lote[k], filas = filasLote[k] || [];
+            const vistos = new Set();
+            for (const f of filas) {
+              if (!f.olpn.toUpperCase().includes(q) && !String(f.guia).includes(q) &&
+                  !String(f.num_documentos).toUpperCase().includes(q)) continue;
+              const id = `${f.olpn}|${f.guia}`;
+              if (vistos.has(id)) continue;
+              vistos.add(id);
+              const { blobs } = await s.list({ prefix: prefijoOlpn(carga.auditId, f.olpn, f.guia) });
+              const a = parsearAudit(blobs.map((b) => b.key), carga.auditId)[0];
+              resultados.push({
+                cruceId: carga.cruceId, cargado_en: carga.cargado_en, archivos: carga.archivos,
+                actual: carga.cruceId === meta?.cruceId,
+                olpn: f.olpn, guia: f.guia, num_documentos: f.num_documentos,
+                destinatario: f.nom_destinatario, destino: f.ciudest,
+                caja: `${f.indiceolpn} de ${f.num_unidades}`,
+                impreso: !!a, fecha_hora: a?.fecha_hora || "", estacion: a?.estacion || "",
+              });
+              if (resultados.length >= 100) break;
+            }
+          }
+          if (resultados.length >= 100) break;
+        }
+        resultados.sort((x, y) => y.cargado_en.localeCompare(x.cargado_en));
+        return json({ cargas_revisadas: enRango.length, resultados });
       }
 
       if (req.method === "GET" && ruta.startsWith("historial/")) {
