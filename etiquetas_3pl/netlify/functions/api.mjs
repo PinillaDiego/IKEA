@@ -8,13 +8,16 @@
  *   POST /api/registrar    { olpn, guia, estacion } → registra en auditoría tras imprimir
  *   GET  /api/pendientes   OLPN sin imprimir
  *   GET  /api/auditoria    registros impresos
+ *   GET  /api/historial    cargas anteriores (más reciente primero)
+ *   GET  /api/historial/<id>  detalle de una carga: cada OLPN con su estado de impresión
  *
  * Seguridad: si la variable de entorno APP_PIN existe, cada petición debe traer
  * el encabezado X-App-Pin con ese valor.
  *
  * Almacenamiento (store "etiquetas"):
  *   meta                       { cruceId, auditId, archivos, cargado_en, total }
- *   c/<cruceId>                filas del cruce (JSON)
+ *   c/<cruceId>                filas del cruce (JSON) — se conservan todas para el historial
+ *   hist                       índice de cargas [{ cruceId, auditId, archivos, cargado_en, ... }]
  *   a/<auditId>/<olpn>|<guia>|<fecha>|<estacion>   un registro por etiqueta impresa
  *     (los datos van en la llave: un solo list() trae toda la auditoría y no hay
  *      condiciones de carrera entre estaciones porque nadie reescribe un archivo común)
@@ -182,6 +185,29 @@ function calcularPendientes(filas, audit) {
   return out;
 }
 
+async function leerHist(s) {
+  return (await s.get("hist", { type: "json" })) || [];
+}
+
+export function detalleCarga(filas, audit) {
+  const porClave = new Map(audit.map((a) => [`${a.olpn}|${a.guia}`, a]));
+  const vistos = new Set();
+  const out = [];
+  for (const f of filas) {
+    const id = `${f.olpn}|${f.guia}`;
+    if (vistos.has(id)) continue;
+    vistos.add(id);
+    const a = porClave.get(id);
+    out.push({
+      olpn: f.olpn, guia: f.guia, num_documentos: f.num_documentos,
+      nom_destinatario: f.nom_destinatario, ciudest: f.ciudest,
+      caja: `${f.indiceolpn} de ${f.num_unidades}`,
+      impreso: !!a, fecha_hora: a?.fecha_hora || "", estacion: a?.estacion || "",
+    });
+  }
+  return out;
+}
+
 const SCI_NECESARIAS = ["num_documentos", "texto_guia", "telefono_destinatario", "peso_real_k",
   "peso_volumen_k", "valor_declarado", "num_unidades", "obs"];
 const ENVIA_NECESARIAS = ["guia", "num_documentos", "nom_destinatario", "dir_destinatario", "ciudest"];
@@ -197,6 +223,30 @@ export function crearHandler(obtenerStore) {
     try {
       const s = obtenerStore();
       const body = req.method === "POST" ? await req.json().catch(() => ({})) : {};
+
+      if (req.method === "GET" && ruta === "historial") {
+        const meta = await leerMeta(s);
+        const hist = await leerHist(s);
+        if (meta && !hist.some((h) => h.cruceId === meta.cruceId))
+          hist.push({ cruceId: meta.cruceId, auditId: meta.auditId, archivos: meta.archivos, cargado_en: meta.cargado_en });
+        return json(hist.map((h) => ({ ...h, actual: h.cruceId === meta?.cruceId })).reverse());
+      }
+
+      if (req.method === "GET" && ruta.startsWith("historial/")) {
+        const id = decodeURIComponent(ruta.slice("historial/".length));
+        const meta = await leerMeta(s);
+        const hist = await leerHist(s);
+        const carga = hist.find((h) => h.cruceId === id) ||
+                      (meta?.cruceId === id ? { cruceId: meta.cruceId, auditId: meta.auditId, archivos: meta.archivos, cargado_en: meta.cargado_en } : null);
+        if (!carga) return fallo("Carga no encontrada", 404);
+        const filas = await s.get(`c/${id}`, { type: "json" });
+        if (!filas) return fallo("Los datos de esta carga ya no están disponibles", 404);
+        const det = detalleCarga(filas, await leerAudit(s, carga));
+        const impresos = det.filter((d) => d.impreso).length;
+        return json({ carga: { ...carga, actual: carga.cruceId === meta?.cruceId },
+                      resumen: { total: det.length, impresos, pendientes: det.length - impresos },
+                      filas: det });
+      }
 
       switch (`${req.method} ${ruta}`) {
         case "GET status": {
@@ -232,7 +282,23 @@ export function crearHandler(obtenerStore) {
           };
           await s.setJSON(`c/${id}`, r.filas);
           await s.setJSON("meta", meta);
-          if (anterior?.cruceId && anterior.cruceId !== id) await s.delete(`c/${anterior.cruceId}`).catch(() => {});
+
+          const hist = await leerHist(s);
+          if (anterior && !hist.some((h) => h.cruceId === anterior.cruceId)) {
+            // carga hecha antes de existir el historial
+            hist.push({ cruceId: anterior.cruceId, auditId: anterior.auditId,
+                        archivos: anterior.archivos, cargado_en: anterior.cargado_en });
+          }
+          hist.push({
+            cruceId: id,
+            auditId: meta.auditId,
+            archivos: meta.archivos,
+            cargado_en: meta.cargado_en,
+            total: new Set(r.filas.map((f) => `${f.olpn}|${f.guia}`)).size,
+            sin_guia: r.sinGuia.length,
+            reinicio_auditoria: meta.auditId === id && !!anterior,
+          });
+          await s.setJSON("hist", hist);
 
           return json({
             status: "Archivos cargados y combinados exitosamente",
