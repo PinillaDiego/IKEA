@@ -1,0 +1,4 @@
+[build]
+  base = "etiquetas_3pl"
+  publish = "public"
+  functions = "netlify/functions"
